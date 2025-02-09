@@ -1,0 +1,130 @@
+# Before running this, run the above cells first
+# writefile app.py
+import load_dotenv from dotenv
+import os
+
+import streamlit as st
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import ConversationalRetrievalChain
+import tempfile
+from torch import cuda, bfloat16
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+import transformers
+from transformers import StoppingCriteria, StoppingCriteriaList
+from langchain_community.llms import HuggingFacePipeline
+import torch
+
+# Function to trim Unhelpful Answer
+def trim_unhelpful_part(s):
+    s1 = ""
+    for i in range(len(s)):
+        s2 = s[i:i+16]
+        if s2 == "Unhelpful Answer":
+            break
+        s1 += s[i]
+    return s1
+
+# Function to load PDF documents
+def load_documents(file):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+        temp_file.write(file.read())
+        temp_file_path = temp_file.name
+    loader = PyPDFLoader(temp_file_path)
+    return loader.load()
+
+# Function to split documents into texts
+def split_documents(documents, chunk_size=500, chunk_overlap=50):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    return text_splitter.split_documents(documents)
+
+# Function to create embeddings
+def create_embeddings(model_name, device='cuda'):
+    model_name = "sentence-transformers/all-mpnet-base-v2"
+    model_kwargs = {"device": "cuda"}
+    embeddings = HuggingFaceEmbeddings(model_name=model_name, model_kwargs=model_kwargs)
+    return embeddings
+
+# Function to create vector store
+def create_vector_store(texts, embeddings):
+    return FAISS.from_documents(texts, embeddings)
+
+# Function to setup a QA chain
+def setup_retrieval_qa_chain(llm, db):
+    chain = ConversationalRetrievalChain.from_llm(llm, db.as_retriever(), return_source_documents=False)
+    return chain
+
+# Streamlit app
+st.title("PDF Question Answering App")
+
+# Check if a PDF file is uploaded
+uploaded_file = st.file_uploader("Upload a PDF file", type="pdf")
+
+# Initialize session state variables if they don't exist
+if 'processed_data' not in st.session_state:
+    st.session_state.processed_data = None
+if 'qa_chain' not in st.session_state:
+    st.session_state.qa_chain = None
+
+# Process the PDF file if uploaded
+if uploaded_file is not None and st.session_state.processed_data is None:
+    with st.spinner('Processing the PDF...'):
+        documents = load_documents(uploaded_file)
+        texts = split_documents(documents)
+        embeddings = create_embeddings('sentence-transformers/all-MiniLM-L6-v2')
+        db = create_vector_store(texts, embeddings)
+        st.session_state.processed_data = {'documents': documents, 'texts': texts, 'embeddings': embeddings, 'db': db}
+
+        model_id = 'meta-llama/Llama-2-7b-chat-hf'
+        device = f'cuda:{cuda.current_device()}' if cuda.is_available() else 'cpu'
+
+        bnb_config = transformers.BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type='nf4',
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=bfloat16
+        )
+        load_dotenv()
+        hf_auth = os.getenv("HF_AUTH")
+        model_config = AutoConfig.from_pretrained(model_id, use_auth_token=hf_auth)
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, trust_remote_code=True, config=model_config,
+            quantization_config=bnb_config, device_map='auto', use_auth_token=hf_auth
+        )
+        model.eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_id, use_auth_token=hf_auth)
+
+        stop_list = ['\nHuman:', '\n```\n']
+        stop_token_ids = [tokenizer(x)['input_ids'] for x in stop_list]
+        stop_token_ids = [torch.LongTensor(x).to(device) for x in stop_token_ids]
+
+        class StopOnTokens(StoppingCriteria):
+            def _call_(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+                for stop_ids in stop_token_ids:
+                    if torch.eq(input_ids[0][-len(stop_ids):], stop_ids).all():
+                        return True
+                return False
+
+        stopping_criteria = StoppingCriteriaList([StopOnTokens()])
+        generate_text = transformers.pipeline(
+            model=model, tokenizer=tokenizer, return_full_text=False,
+            task='text-generation', stopping_criteria=stopping_criteria,
+            temperature=0.01, max_new_tokens=512, repetition_penalty=1.1
+        )
+        llm = HuggingFacePipeline(pipeline=generate_text)
+        st.session_state.qa_chain = setup_retrieval_qa_chain(llm, db)
+
+    st.success('PDF processed successfully! You can now ask questions.')
+
+query = st.text_input("Ask a question about the PDF")
+
+if query and st.session_state.qa_chain is not None:
+    with st.spinner('Generating answer...'):
+        chat_history = []
+        response = st.session_state.qa_chain({'question': query, 'chat_history': chat_history})
+        s = response['answer']
+        s += "Unhelpful Answer"
+        st.write(trim_unhelpful_part(s))
